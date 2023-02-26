@@ -45,10 +45,19 @@ public:
     if (request_size > AlignedSize_)
       return nullptr;
 
-    // TODO: avoid N threads racing for double allocation here
     if (!chunks_) {
       if (chunks_ = AllocateNewChunk(); !chunks_)
         return nullptr;
+
+      std::optional<std::size_t> position = AddToGlobalChunkList(chunks_);
+      if (position == std::nullopt) {
+        // Free memory.
+        ReleaseChunks(chunks_);
+        chunks_ = nullptr;
+        return nullptr;
+      }
+
+      chunk_position = *position;
 
       // Set current chunk to header
       current_ = chunks_;
@@ -149,7 +158,7 @@ private:
     return AlignedSize_ >= page_size && AlignedSize_ % page_size == 0;
   }
 
-  static dmt::internal::ChunkHeader* AllocateNewChunk() {
+  static internal::ChunkHeader* AllocateNewChunk() {
     auto allocation =
         IsPageMultiple()
             ? internal::AllocatePages(AlignedSize_ / internal::GetPageSize())
@@ -158,7 +167,7 @@ private:
     if (!allocation.has_value())
       return nullptr;
 
-    return dmt::internal::CreateChunkHeaderFromAllocation(allocation.value());
+    return internal::CreateChunkHeaderFromAllocation(allocation.value());
   }
 
   static void ReleaseChunks(dmt::internal::ChunkHeader* chunk) {
@@ -168,57 +177,36 @@ private:
   }
 
   size_t offset_ = 0;
-  dmt::internal::ChunkHeader* chunks_ = nullptr;
-  dmt::internal::ChunkHeader* current_ = nullptr;
+  internal::ChunkHeader* chunks_ = nullptr;
+  internal::ChunkHeader* current_ = nullptr;
 
   std::mutex chunks_mutex_;
 
-  using ChunkList = internal::Node<internal::ChunkHeader>;
+  // Typical page size divided by size of pointer.
+  static constexpr std::size_t kMaxNumberOfChunks = 4096 / sizeof(uintptr_t);
+  inline static thread_local std::array<uintptr_t, kMaxNumberOfChunks>
+      chunks_lookup_table = {0};
+  size_t chunk_position = 0;
 
-  inline static thread_local ChunkList* global_chunk_list_head_ = nullptr;
-  inline static thread_local ChunkList* global_chunk_list_tail_ = nullptr;
-
-  ChunkList* local_chunk_list = nullptr;
-
-  static void AddToGlobalChunkList(ChunkList* chunk_list) {
-    if (!global_chunk_list_head_) {
-      global_chunk_list_head_ = chunk_list;
-      global_chunk_list_head_->next = nullptr; // Sanity check.
-      global_chunk_list_head_->prev = nullptr; // Sanity check.
-    } else if (!global_chunk_list_tail_) {
-      global_chunk_list_tail_ = chunk_list;
-      global_chunk_list_head_->next = global_chunk_list_tail_;
-      global_chunk_list_tail_->prev = global_chunk_list_head_;
-    } else {
-      global_chunk_list_tail_->next = chunk_list;
-      chunk_list->prev = global_chunk_list_tail_;
-      global_chunk_list_tail_ = chunk_list;
-    }
-  }
-
-  static void RemoveFromGlobalChunkList(ChunkList* chunk_list) {
+  static std::optional<std::size_t>
+  AddToGlobalChunkList(internal::ChunkHeader* chunk_list) {
     assert(chunk_list != nullptr);
 
-    if (chunk_list == global_chunk_list_head_) {
-      global_chunk_list_head_ = chunk_list->next;
-      if (global_chunk_list_head_) {
-        global_chunk_list_head_->prev = nullptr;
-      }
-    } else if (chunk_list == global_chunk_list_tail_) {
-      global_chunk_list_tail_ = chunk_list->prev;
-      global_chunk_list_tail_->next = nullptr;
-    } else {
-      internal::Extract(chunk_list);
-    }
+    auto itr = std::find_first_of(chunks_lookup_table.begin(),
+                                  chunks_lookup_table.end(),
+                                  [](uintptr_t p) { return p == 0; });
 
-    if (chunk_list->prev)
-      chunk_list->prev = nullptr;
+    // Table is full, we can't create any more allocators in this thread.
+    if (itr == chunks_lookup_table.end())
+      return std::nullopt;
 
-    if (chunk_list->next)
-      chunk_list->next = nullptr;
+    std::size_t pos = std::distance(chunks_lookup_table.begin(), itr);
+    chunks_lookup_table[pos] = static_cast<uintptr_t>(chunk_list);
+    return pos;
+  }
 
-    if (global_chunk_list_head_ == global_chunk_list_tail_)
-      global_chunk_list_tail_ = nullptr;
+  static void RemoveFromGlobalChunkList(std::size_t position) {
+    chunks_lookup_table[pos] = 0;
   }
 };
 
